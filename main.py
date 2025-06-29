@@ -1,240 +1,292 @@
+import os
 import json
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk
 import uuid
+import asyncio
+import logging
+import traceback
+import time
+from math import exp
+from typing import List, Optional
+
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
-# Elasticsearch index name
+# Configuration
 INDEX_NAME = "dossiers_medicaux"
+EMBEDDING_DIM = 384
+FAISS_INDEX_PATH = "faiss_hnsw.index"
+FAISS_IDS_PATH = "faiss_ids.json"
+RERANK_CANDIDATES = 5
 
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("hybrid_search_app")
+
+# FastAPI initialization with CORS
 app = FastAPI()
-
-# Connect to Elasticsearch (ensure you're using the official distribution)
-es = Elasticsearch(
-    "http://127.0.0.1:9200",
-    request_timeout=30,
-    max_retries=10,
-    retry_on_timeout=True
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
-# Initialize SentenceTransformer model (384-dimensional embeddings)
-model = SentenceTransformer("all-MiniLM-L6-v2")
-EMBEDDING_DIM = 384
+# Elasticsearch client
+es = Elasticsearch(
+    "http://34.224.105.165:9200",
+    request_timeout=30,
+    max_retries=10,
+    retry_on_timeout=True,
+)
 
-# Define Elasticsearch mapping using dense_vector for embeddings.
-mapping = {
-    "mappings": {
-        "properties": {
-            "title": {"type": "text"},
-            "content": {"type": "text"},
-            "summary": {"type": "text"},
-            "embedding": {"type": "dense_vector", "dims": EMBEDDING_DIM}
+# SentenceTransformer models
+model = SentenceTransformer("all-MiniLM-L6-v2")
+try:
+    reranker = CrossEncoder(
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        device="cuda"
+    )
+except Exception:
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# FAISS index and document ID store
+faiss_index: faiss.IndexFlat = None
+faiss_doc_ids: List[str] = []
+faiss_lock = asyncio.Lock()
+
+# ----------------------
+# Helper functions
+# ----------------------
+
+def sigmoid(x: float) -> float:
+    """Convert logit to probability between 0 and 1."""
+    return 1.0 / (1.0 + exp(-x))
+
+# ----------------------
+# Elasticsearch & FAISS setup
+# ----------------------
+
+def create_index() -> None:
+    """Create Elasticsearch index with dense_vector and synonym analyzer."""
+    mapping = {
+        "settings": {
+            "analysis": {
+                "filter": {
+                    "synonym_filter": {
+                        "type": "synonym",
+                        "synonyms": [
+                            "myocardial infarction, heart attack",
+                            "cancer, malignant tumor"
+                        ]
+                    }
+                },
+                "analyzer": {
+                    "synonym_analyzer": {
+                        "tokenizer": "standard",
+                        "filter": ["lowercase", "synonym_filter"]
+                    }
+                }
+            }
+        },
+        "mappings": {
+            "properties": {
+                "title": {"type": "text", "analyzer": "synonym_analyzer"},
+                "content": {"type": "text", "analyzer": "synonym_analyzer"},
+                "summary": {"type": "text", "analyzer": "synonym_analyzer"},
+                "embedding": {"type": "dense_vector", "dims": EMBEDDING_DIM}
+            }
         }
     }
-}
-
-@app.on_event("startup")
-async def startup_event():
-    # Create Elasticsearch index if it does not exist.
-    print("Checking if Elasticsearch index exists...")
     if not es.indices.exists(index=INDEX_NAME):
-        try:
-            print(f"Index {INDEX_NAME} not found. Creating...")
-            es.indices.create(index=INDEX_NAME, body=mapping)
-            print(f"Index {INDEX_NAME} created successfully.")
-        except Exception as e:
-            print("Error creating index:", str(e))
-            raise HTTPException(status_code=500, detail=str(e))
-    else:
-        print(f"Index {INDEX_NAME} already exists.")
-    # Initialize global FAISS index and document ID mapping.
-    initialize_faiss_index()
+        es.indices.create(index=INDEX_NAME, body=mapping)
+        logger.info(f"Created index: {INDEX_NAME}")
 
-# --- Global FAISS index setup ---
-faiss_index = None
-faiss_doc_ids = []  # Maps FAISS index positions to Elasticsearch document IDs
 
-def initialize_faiss_index():
+def load_faiss() -> None:
+    """Load or initialize the FAISS index and document ID list."""
     global faiss_index, faiss_doc_ids
-    # Using a flat index with Inner Product (vectors are normalized for cosine similarity)
-    faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM)
-    faiss_doc_ids = []
-    print("FAISS index initialized.")
+    if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_IDS_PATH):
+        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+        with open(FAISS_IDS_PATH, "r") as f:
+            faiss_doc_ids = json.load(f)
+        logger.info("FAISS index loaded from disk.")
+    else:
+        faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIM, 32)
+        faiss_index.hnsw.efConstruction = 200
+        faiss_doc_ids = []
+        logger.info("Initialized new FAISS index.")
 
-def normalize_vector(vec: np.ndarray) -> np.ndarray:
-    norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
 
-# --- Data model ---
+def save_faiss() -> None:
+    """Persist the FAISS index and doc IDs to disk."""
+    faiss.write_index(faiss_index, FAISS_INDEX_PATH)
+    with open(FAISS_IDS_PATH, "w") as f:
+        json.dump(faiss_doc_ids, f)
+    logger.info("FAISS index saved to disk.")
+
+# Startup event
+@app.on_event("startup")
+async def startup_event() -> None:
+    create_index()
+    load_faiss()
+
+# ----------------------
+# Pydantic models
+# ----------------------
+
 class Document(BaseModel):
     title: str
     content: str
     summary: str
 
-@app.post("/add_document")
-async def add_document(docs: List[Document]):
-    """
-    For each document, generate an embedding using (content + summary),
-    then insert the document into Elasticsearch and update the FAISS index.
-    """
-    global faiss_index, faiss_doc_ids
-    print("=== Adding documents (Hybrid) ===")
-    es_actions = []
-    for doc in docs:
-        text = f"{doc.content} {doc.summary}"
-        embedding = model.encode(text)
-        embedding = np.array(embedding, dtype=np.float32)
-        embedding = normalize_vector(embedding)
-        doc_id = str(uuid.uuid4())
-        doc_source = {
-            "title": doc.title,
-            "content": doc.content,
-            "summary": doc.summary,
-            "embedding": embedding.tolist()
-        }
-        action = {"_index": INDEX_NAME, "_id": doc_id, "_source": doc_source}
-        es_actions.append(action)
-        # Update FAISS index and document ID mapping.
-        faiss_index.add(np.expand_dims(embedding, axis=0))
-        faiss_doc_ids.append(doc_id)
-        print(f"Document '{doc.title}' added with ID {doc_id}")
-    try:
-        success, errors = bulk(es, es_actions)
-        print(f"Bulk insert: {success} documents inserted. Errors: {errors}")
-    except Exception as e:
-        print("Bulk insert error:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"inserted": len(docs), "success": success}
 
-# --- Hybrid Search Endpoint ---
-class HybridSearchRequest(BaseModel):
+class SearchRequest(BaseModel):
     query: str
-    text_size: int = 50    # Number of candidate docs to retrieve by text search
-    vector_size: int = 50  # Number of candidate docs to retrieve by FAISS
-    final_k: int = 5       # Final number of results to return
-    weight_text: float = 1.0   # Weight for normalized text score
-    weight_vector: float = 1.0 # Weight for vector score
+    text_size: int = 50
+    vector_size: int = 50
+    final_k: int = 5
+    weight_text: float = 1.0
+    weight_vector: float = 1.0
+    detailed: bool = Query(False)
 
-@app.post("/hybrid_search")
-async def hybrid_search(request: HybridSearchRequest):
+
+class SearchResult(BaseModel):
+    id: str
+    title: str
+    content: str
+    summary: str
+    score: float
+
+
+class SearchResponse(BaseModel):
+    results: List[SearchResult]
+    note: Optional[str] = None
+
+# ----------------------
+# API endpoints
+# ----------------------
+
+@app.post("/add_document")
+async def add_documents(docs: List[Document]) -> dict:
     """
-    Performs hybrid search by:
-      1. Running a text search on Elasticsearch (BM25).
-      2. Running FAISS ANN search for cosine similarity.
-      3. Normalizing and combining scores additively.
-    Returns the top 'final_k' documents with id, title, content, summary, and combined score.
+    Add documents to Elasticsearch and FAISS index.
     """
-    global faiss_index, faiss_doc_ids
-    print("=== Hybrid Search ===")
-    print(f"Query received: {request.query}")
-
-    # Step 1: FAISS vector search
-    query_embedding = model.encode(request.query)
-    query_embedding = np.array(query_embedding, dtype=np.float32)
-    query_embedding = normalize_vector(query_embedding)
-    vector_k = request.vector_size
-    D, I = faiss_index.search(np.expand_dims(query_embedding, axis=0), vector_k)
-    faiss_candidates = {}
-    for i, idx in enumerate(I[0]):
-        idx = int(idx)  # Ensure the index is an integer.
-        if idx < 0 or idx >= len(faiss_doc_ids):
-            continue
-        doc_id = faiss_doc_ids[idx]
-        faiss_candidates[doc_id] = float(D[0][i])
-    print(f"FAISS found {len(faiss_candidates)} candidate IDs.")
-
-    # Step 2: Text search on Elasticsearch
-    if faiss_candidates:
-        text_query = {
-            "size": request.text_size,
-            "query": {
-                "bool": {
-                    "must": {
-                        "multi_match": {
-                            "query": request.query,
-                            "fields": ["title", "content", "summary"],
-                            "fuzziness": "AUTO"
-                        }
-                    },
-                    "filter": {"terms": {"_id": list(faiss_candidates.keys())}}
+    actions = []
+    async with faiss_lock:
+        for doc in docs:
+            text = f"{doc.content} {doc.summary}"
+            emb = np.array(model.encode(text), dtype=np.float32)
+            emb /= np.linalg.norm(emb)
+            doc_id = str(uuid.uuid4())
+            actions.append({
+                "_index": INDEX_NAME,
+                "_id": doc_id,
+                "_source": {
+                    "title": doc.title,
+                    "content": doc.content,
+                    "summary": doc.summary,
+                    "embedding": emb.tolist(),
                 }
-            }
-        }
-    else:
-        text_query = {
-            "size": request.text_size,
-            "query": {
-                "multi_match": {
-                    "query": request.query,
-                    "fields": ["title", "content", "summary"],
-                    "fuzziness": "AUTO"
-                }
-            }
-        }
+            })
+            faiss_index.add(emb.reshape(1, -1))
+            faiss_doc_ids.append(doc_id)
+        success, errors = bulk(es, actions)
+        save_faiss()
+    return {"inserted": len(docs), "errors": errors}
+
+
+@app.post("/hybrid_search", response_model=SearchResponse)
+async def hybrid_search(req: SearchRequest) -> SearchResponse:
+    """
+    Perform hybrid search: BM25 + FAISS, then optional Cross-Encoder rerank.
+    """
     try:
-        text_response = es.search(index=INDEX_NAME, body=text_query)
-    except Exception as e:
-        print("Error during Elasticsearch text search:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-    text_scores = {}
-    for hit in text_response["hits"]["hits"]:
-        doc_id = hit["_id"]
-        text_scores[doc_id] = hit["_score"]
-    print(f"Elasticsearch text search returned {len(text_scores)} candidate documents.")
+        # Encode query
+        q_emb = np.array(model.encode(req.query), dtype=np.float32)
+        q_emb /= np.linalg.norm(q_emb)
 
-    # Step 3: Normalize text scores and combine scores additively.
-    combined_candidates = []
-    if text_scores:
-        max_text_score = max(text_scores.values())
-    else:
-        max_text_score = 1.0
-
-    if not faiss_candidates:
-        print("No FAISS candidates found, using text search results only.")
-        # Use normalized text score alone.
-        for doc_id, score in text_scores.items():
-            normalized_text = score / max_text_score
-            combined_candidates.append((doc_id, request.weight_text * normalized_text))
-    else:
-        for doc_id in set(faiss_candidates.keys()).intersection(text_scores.keys()):
-            normalized_text = text_scores[doc_id] / max_text_score
-            # Combine scores additively.
-            combined_score = request.weight_text * normalized_text + request.weight_vector * faiss_candidates[doc_id]
-            combined_candidates.append((doc_id, combined_score))
-    combined_candidates.sort(key=lambda x: x[1], reverse=True)
-    top_candidates = combined_candidates[: request.final_k]
-    print("Top candidates after combining scores:")
-    for rank, (doc_id, score) in enumerate(top_candidates, start=1):
-        print(f"{rank}. Doc ID: {doc_id} with combined score: {score:.4f}")
-
-    # Step 4: Retrieve full documents from Elasticsearch
-    final_docs = []
-    if top_candidates:
-        doc_ids = [doc_id for doc_id, _ in top_candidates]
+        # Elasticsearch BM25 + kNN query
+        es_query = {
+            "size": max(req.text_size, req.vector_size),
+            "query": {"bool": {"should": [
+                {"multi_match": {
+                    "query": req.query,
+                    "fields": ["title","content","summary"],
+                    "analyzer": "synonym_analyzer",
+                    "fuzziness": "AUTO",
+                    "boost": req.weight_text
+                }},
+                {"knn": {"embedding": {"vector": q_emb.tolist(), "k": req.vector_size, "boost": req.weight_vector}}}
+            ]}}
+        }
         try:
-            final_response = es.mget(index=INDEX_NAME, body={"ids": doc_ids})
-        except Exception as e:
-            print("Error during mget:", str(e))
-            raise HTTPException(status_code=500, detail=str(e))
-        for doc in final_response.get("docs", []):
-            if doc.get("found"):
-                source = doc["_source"]
-                final_docs.append({
-                    "id": doc["_id"],
-                    "title": source.get("title"),
-                    "content": source.get("content"),
-                    "summary": source.get("summary"),
-                    "combined_score": next((score for id_, score in top_candidates if id_ == doc["_id"]), None)
-                })
+            res = es.search(index=INDEX_NAME, body=es_query)
+        except Exception:
+            # Fallback to text-only
+            text_q = {"size": req.text_size, "query": {"multi_match": {"query": req.query, "fields": ["title","content","summary"], "fuzziness": "AUTO"}}}
+            res = es.search(index=INDEX_NAME, body=text_q)
+        es_scores = {h["_id"]: h["_score"] for h in res["hits"]["hits"]}
 
-    # Print the top candidate details in a JSON-like format.
-    print("Final Top Candidates:")
-    print(json.dumps(final_docs, indent=2))
-    return {"results": final_docs}
+        # FAISS search
+        async with faiss_lock:
+            D, I = faiss_index.search(q_emb.reshape(1, -1), req.vector_size)
+        faiss_scores = {faiss_doc_ids[int(idx)]: float(D[0][i]) for i, idx in enumerate(I[0]) if idx >= 0}
 
+        # Combine scores
+        max_es = max(es_scores.values()) if es_scores else 1.0
+        vals_f = list(faiss_scores.values()) or [0.0,1.0]
+        min_f, max_f = min(vals_f), max(vals_f)
+        total_weight = req.weight_text + req.weight_vector
+        combined = []
+        for did in set(es_scores) & set(faiss_scores):
+            norm_es = es_scores[did] / max_es
+            norm_f = (faiss_scores[did] - min_f) / (max_f - min_f) if max_f > min_f else faiss_scores[did]
+            score = (req.weight_text * norm_es + req.weight_vector * norm_f) / total_weight
+            combined.append((did, score))
+        combined.sort(key=lambda x: x[1], reverse=True)
 
+        # Top-k selection
+        combined_dict = dict(combined)
+        top_ids = list(combined_dict.keys())[:req.final_k] if combined_dict else []
+        if not top_ids:
+            # Fallback text-only sort
+            sorted_es = sorted(es_scores.items(), key=lambda x: x[1], reverse=True)
+            top_ids = [did for did, _ in sorted_es[:req.final_k]]
+            combined_dict = {did: min(1.0, es_scores[did]/max_es) for did in top_ids}
+
+        # Retrieve documents
+        docs_resp = es.mget(index=INDEX_NAME, body={"ids": top_ids})
+        results: List[SearchResult] = []
+        for d in docs_resp.get("docs", []):
+            if d.get("found"):
+                src = d["_source"]
+                results.append(SearchResult(
+                    id=d["_id"],
+                    title=src["title"],
+                    content=src["content"],
+                    summary=src["summary"],
+                    score=combined_dict.get(d["_id"], 0.0)
+                ))
+
+        # Quick mode
+        if not req.detailed:
+            return SearchResponse(results=results, note="bm25+faiss only")
+
+        # Cross-encoder rerank
+        raw_scores = reranker.predict([(req.query, doc.content) for doc in results])
+        for idx, raw in enumerate(raw_scores):
+            results[idx].score = sigmoid(raw)
+        results.sort(key=lambda x: x.score, reverse=True)
+
+        return SearchResponse(results=results, note="cross-encoder applied")
+
+    except Exception:
+        tb = traceback.format_exc()
+        logger.error(f"hybrid_search ERROR:\n{tb}")
+        raise HTTPException(status_code=500, detail="Internal server error")
