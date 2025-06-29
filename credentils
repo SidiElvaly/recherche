@@ -1,0 +1,6 @@
+Service,Endpoint,Description
+FastAPI (API base),https://34.224.105.165.nip.io,Base URL
+FastAPI – Search,https://34.224.105.165.nip.io/hybrid_search,"POST body {query:""...""}"
+FastAPI – Swagger UI,https://34.224.105.165.nip.io/docs,Interactive docs
+Elasticsearch,https://es.34.224.105.165.nip.io,Requires basic‑auth username=admin password=SidiElvaly
+Kibana,https://kibana.34.224.105.165.nip.io,Requires basic‑auth the same auth as elastic 
